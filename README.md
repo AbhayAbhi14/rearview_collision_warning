@@ -12,6 +12,6 @@ Create a virtual environment → python -m venv rcas
 Activate it → rcas\Scripts\activate
 Install dependencies → pip install opencv-python easyocr pytesseract numpy
 Download dataset → https://www.kaggle.com/datasets/surya498/irapsd-v2b-v01?resource=download
-Run the script → python your_script.py
+Run the script → python your_script.py (both script)
 Deactivate → deactivate
 

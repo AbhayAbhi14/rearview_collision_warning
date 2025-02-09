@@ -11,7 +11,7 @@ def extract_speed(text):
     return int(match.group(1)) if match else None
 
 # Load video
-video_path = "C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/testing/Copy of NO20230924-121041-000402B.mp4"
+video_path = "C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rcas/testing/Copy of NO20230924-121041-000402B.mp4"
 cap = cv2.VideoCapture(video_path)
 
 # Get video properties
@@ -21,7 +21,7 @@ frame_height = int(cap.get(4))
 
 # Define the codec and create VideoWriter object
 output_path = "demo_video.mp4"
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')  
+fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Changed codec to XVID
 out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
 frame_interval = fps * 2  # Process every 2 seconds
@@ -32,6 +32,7 @@ status_message = "RCAS: OFF"  # Default status
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
+        print("End of video or failed to read frame.")
         break
 
     frame_number += 1
@@ -57,16 +58,15 @@ while cap.isOpened():
         # Extract speed value
         detected_speed = extract_speed(text)
         if detected_speed is not None:
-            # Determine if speed is increasing or decreasing
-            if previous_speed is not None:
-                if detected_speed < previous_speed:
-                    status_message = "RCAS: Active"
-                elif detected_speed > previous_speed:
-                    status_message = "RCAS: OFF"
+            # Determine if braking (speed decreasing)
+            if previous_speed is not None and detected_speed < previous_speed:
+                status_message = "RCAS: Active"
+            else:
+                status_message = "RCAS: OFF"
 
             previous_speed = detected_speed  # Update previous speed
 
-    # Overlay speed text on the frame
+    # Overlay speed and status text
     if previous_speed is not None:
         text_display = f"Speed: {previous_speed} km/h"
         status_display = status_message
@@ -84,8 +84,16 @@ while cap.isOpened():
         cv2.putText(frame, text_display, (text_x, text_y), font, font_scale, text_color, font_thickness)
         cv2.putText(frame, status_display, (text_x, status_y), font, font_scale, status_color, font_thickness)
 
+        # Display warning if braking
+        if status_message == "RCAS: Active":
+            warning_text = "Press Accelerator or Change Lane"
+            warning_x = frame_width // 4
+            warning_y = 50  # Top center
+            cv2.putText(frame, warning_text, (warning_x, warning_y), font, 1.2, (0, 0, 255), 3)
+
     # Write frame to output video
     out.write(frame)
+    print(f"Frame {frame_number} written successfully.")
 
     # Optional: Display the frame while processing
     cv2.imshow('Video Processing', frame)
