@@ -1,6 +1,10 @@
 import cv2
 import struct
 import os
+import errno
+import argparse
+import time
+import tensorflow.compat.v1 as tf
 import numpy as np
 import colorsys
 from keras.layers import Conv2D
@@ -17,8 +21,12 @@ from matplotlib.patches import Rectangle
 from numpy import expand_dims
 from keras.preprocessing.image import load_img, img_to_array
 import random
+import scipy.linalg
+from scipy.optimize import linear_sum_assignment
 
-#Can shift the variables to RCAS.py 
+#Can shift the variable and global functions to RCAS.py 
+INFTY_COST = 1e+5
+
 label_map = {
     "person": "blue",
     "bicycle": "yellow",
@@ -30,6 +38,17 @@ label_map = {
     "train": "white",
     "boat": "white"
 }
+
+chi2inv95 = {
+    1: 3.8415,
+    2: 5.9915,
+    3: 7.8147,
+    4: 9.4877,
+    5: 11.070,
+    6: 12.592,
+    7: 14.067,
+    8: 15.507,
+    9: 16.919}
 
 NUM_CLASS = {
     0: 'person',
@@ -413,9 +432,289 @@ def draw_bbox(image, bboxes, CLASSES, show_label=True, show_confidence = True, T
 
     return image
 
+def min_cost_matching(
+        distance_metric, max_distance, tracks, detections, track_indices=None,
+        detection_indices=None):
+
+    if track_indices is None:
+        track_indices = np.arange(len(tracks))
+    if detection_indices is None:
+        detection_indices = np.arange(len(detections))
+
+    if len(detection_indices) == 0 or len(track_indices) == 0:
+        return [], track_indices, detection_indices  # Nothing to match.
+
+    cost_matrix = distance_metric(
+        tracks, detections, track_indices, detection_indices)
+    cost_matrix[cost_matrix > max_distance] = max_distance + 1e-5
+    indices = linear_sum_assignment(cost_matrix)
+    indices = np.asarray(indices)
+    indices = np.transpose(indices)
+    matches, unmatched_tracks, unmatched_detections = [], [], []
+    for col, detection_idx in enumerate(detection_indices):
+        if col not in indices[:, 1]:
+            unmatched_detections.append(detection_idx)
+    for row, track_idx in enumerate(track_indices):
+        if row not in indices[:, 0]:
+            unmatched_tracks.append(track_idx)
+    for row, col in indices:
+        track_idx = track_indices[row]
+        detection_idx = detection_indices[col]
+        if cost_matrix[row, col] > max_distance:
+            unmatched_tracks.append(track_idx)
+            unmatched_detections.append(detection_idx)
+        else:
+            matches.append((track_idx, detection_idx))
+    return matches, unmatched_tracks, unmatched_detections
 
 
+def matching_cascade(
+        distance_metric, max_distance, cascade_depth, tracks, detections,
+        track_indices=None, detection_indices=None):
+    if track_indices is None:
+        track_indices = list(range(len(tracks)))
+    if detection_indices is None:
+        detection_indices = list(range(len(detections)))
 
+    unmatched_detections = detection_indices
+    matches = []
+    for level in range(cascade_depth):
+        if len(unmatched_detections) == 0:  # No detections left
+            break
+
+        track_indices_l = [
+            k for k in track_indices
+            if tracks[k].time_since_update == 1 + level
+        ]
+        if len(track_indices_l) == 0:  # Nothing to match at this level
+            continue
+
+        matches_l, _, unmatched_detections = \
+            min_cost_matching(
+                distance_metric, max_distance, tracks, detections,
+                track_indices_l, unmatched_detections)
+        matches += matches_l
+    unmatched_tracks = list(set(track_indices) - set(k for k, _ in matches))
+    return matches, unmatched_tracks, unmatched_detections
+
+
+def gate_cost_matrix(
+        kf, cost_matrix, tracks, detections, track_indices, detection_indices,
+        gated_cost=INFTY_COST, only_position=False):
+    gating_dim = 2 if only_position else 4
+    gating_threshold = chi2inv95[gating_dim]
+    measurements = np.asarray(
+        [detections[i].to_xyah() for i in detection_indices])
+    for row, track_idx in enumerate(track_indices):
+        track = tracks[track_idx]
+        gating_distance = kf.gating_distance(
+            track.mean, track.covariance, measurements, only_position)
+        cost_matrix[row, gating_distance > gating_threshold] = gated_cost
+    return cost_matrix
+
+def iou(bbox, candidates):
+    bbox_tl, bbox_br = bbox[:2], bbox[:2] + bbox[2:]
+    candidates_tl = candidates[:, :2]
+    candidates_br = candidates[:, :2] + candidates[:, 2:]
+
+    tl = np.c_[np.maximum(bbox_tl[0], candidates_tl[:, 0])[:, np.newaxis],
+               np.maximum(bbox_tl[1], candidates_tl[:, 1])[:, np.newaxis]]
+    br = np.c_[np.minimum(bbox_br[0], candidates_br[:, 0])[:, np.newaxis],
+               np.minimum(bbox_br[1], candidates_br[:, 1])[:, np.newaxis]]
+    wh = np.maximum(0., br - tl)
+
+    area_intersection = wh.prod(axis=1)
+    area_bbox = bbox[2:].prod()
+    area_candidates = candidates[:, 2:].prod(axis=1)
+    return area_intersection / (area_bbox + area_candidates - area_intersection)
+
+
+def iou_cost(tracks, detections, track_indices=None,
+             detection_indices=None):
+    if track_indices is None:
+        track_indices = np.arange(len(tracks))
+    if detection_indices is None:
+        detection_indices = np.arange(len(detections))
+
+    cost_matrix = np.zeros((len(track_indices), len(detection_indices)))
+    for row, track_idx in enumerate(track_indices):
+        if tracks[track_idx].time_since_update > 1:
+            cost_matrix[row, :] = linear_assignment.INFTY_COST
+            continue
+
+        bbox = tracks[track_idx].to_tlwh()
+        candidates = np.asarray([detections[i].tlwh for i in detection_indices])
+        cost_matrix[row, :] = 1. - iou(bbox, candidates)
+    return cost_matrix
+
+def non_max_suppression(boxes, classes, max_bbox_overlap, scores=None):
+    if len(boxes) == 0:
+        return []
+
+    boxes = boxes.astype(np.float)
+    pick = []
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2] + boxes[:, 0]
+    y2 = boxes[:, 3] + boxes[:, 1]
+
+    area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    if scores is not None:
+        idxs = np.argsort(scores)
+    else:
+        idxs = np.argsort(y2)
+
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[last]
+        pick.append(i)
+
+        xx1 = np.maximum(x1[i], x1[idxs[:last]])
+        yy1 = np.maximum(y1[i], y1[idxs[:last]])
+        xx2 = np.minimum(x2[i], x2[idxs[:last]])
+        yy2 = np.minimum(y2[i], y2[idxs[:last]])
+
+        w = np.maximum(0, xx2 - xx1 + 1)
+        h = np.maximum(0, yy2 - yy1 + 1)
+
+        overlap = (w * h) / area[idxs[:last]]
+
+        idxs = np.delete(
+            idxs, np.concatenate(
+                ([last], np.where(overlap > max_bbox_overlap)[0])))
+
+    return pick
+
+def _pdist(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)))
+    a2, b2 = np.square(a).sum(axis=1), np.square(b).sum(axis=1)
+    r2 = -2. * np.dot(a, b.T) + a2[:, None] + b2[None, :]
+    r2 = np.clip(r2, 0., float(np.inf))
+    return r2
+
+
+def _cosine_distance(a, b, data_is_normalized=False):
+    if not data_is_normalized:
+        a = np.asarray(a) / np.linalg.norm(a, axis=1, keepdims=True)
+        b = np.asarray(b) / np.linalg.norm(b, axis=1, keepdims=True)
+    return 1. - np.dot(a, b.T)
+
+
+def _nn_euclidean_distance(x, y):
+    distances = _pdist(x, y)
+    return np.maximum(0.0, distances.min(axis=0))
+
+
+def _nn_cosine_distance(x, y):
+    distances = _cosine_distance(x, y)
+    return distances.min(axis=0)
+
+
+def extract_image_patch(image, bbox, patch_shape):
+    bbox = np.array(bbox)
+    if patch_shape is not None:
+        # correct aspect ratio to patch shape
+        target_aspect = float(patch_shape[1]) / patch_shape[0]
+        new_width = target_aspect * bbox[3]
+        bbox[0] -= (new_width - bbox[2]) / 2
+        bbox[2] = new_width
+
+    # convert to top left, bottom right
+    bbox[2:] += bbox[:2]
+    bbox = bbox.astype(int)
+
+    # clip at image boundaries
+    bbox[:2] = np.maximum(0, bbox[:2])
+    bbox[2:] = np.minimum(np.asarray(image.shape[:2][::-1]) - 1, bbox[2:])
+    if np.any(bbox[:2] >= bbox[2:]):
+        return None
+    sx, sy, ex, ey = bbox
+    image = image[sy:ey, sx:ex]
+    image = cv2.resize(image, tuple(patch_shape[::-1]))
+    return image
+
+def create_box_encoder(model_filename, input_name="images:0", output_name="features:0", batch_size=32):
+    image_encoder = ImageEncoder(model_filename, input_name, output_name)
+    image_shape = image_encoder.image_shape
+
+    def encoder(image, boxes):
+        image_patches = []
+        for box in boxes:
+            patch = extract_image_patch(image, box, image_shape[:2])
+            if patch is None:
+                print("WARNING: Failed to extract image patch: %s." % str(box))
+                patch = np.random.uniform(0., 255., image_shape).astype(np.uint8)
+            image_patches.append(patch)
+        image_patches = np.asarray(image_patches)
+        return image_encoder(image_patches, batch_size)
+
+    return encoder
+
+
+def generate_detections(encoder, mot_dir, output_dir, detection_dir=None):
+    if detection_dir is None:
+        detection_dir = mot_dir
+    try:
+        os.makedirs(output_dir)
+    except OSError as exception:
+        if exception.errno == errno.EEXIST and os.path.isdir(output_dir):
+            pass
+        else:
+            raise ValueError(
+                "Failed to created output directory '%s'" % output_dir)
+
+    for sequence in os.listdir(mot_dir):
+        print("Processing %s" % sequence)
+        sequence_dir = os.path.join(mot_dir, sequence)
+
+        image_dir = os.path.join(sequence_dir, "img1")
+        image_filenames = {
+            int(os.path.splitext(f)[0]): os.path.join(image_dir, f)
+            for f in os.listdir(image_dir)}
+
+        detection_file = os.path.join(
+            detection_dir, sequence, "det/det.txt")
+        detections_in = np.loadtxt(detection_file, delimiter=',')
+        detections_out = []
+
+        frame_indices = detections_in[:, 0].astype(np.int)
+        min_frame_idx = frame_indices.astype(np.int).min()
+        max_frame_idx = frame_indices.astype(np.int).max()
+        for frame_idx in range(min_frame_idx, max_frame_idx + 1):
+            print("Frame %05d/%05d" % (frame_idx, max_frame_idx))
+            mask = frame_indices == frame_idx
+            rows = detections_in[mask]
+
+            if frame_idx not in image_filenames:
+                print("WARNING could not find image for frame %d" % frame_idx)
+                continue
+            bgr_image = cv2.imread(
+                image_filenames[frame_idx], cv2.IMREAD_COLOR)
+            features = encoder(bgr_image, rows[:, 2:6].copy())
+            detections_out += [np.r_[(row, feature)] for row, feature
+                               in zip(rows, features)]
+
+        output_filename = os.path.join(output_dir, "%s.npy" % sequence)
+        np.save(
+            output_filename, np.asarray(detections_out), allow_pickle=False)
+
+def _run_in_batches(f, data_dict, out, batch_size):
+    data_len = len(out)
+    num_batches = int(data_len / batch_size)
+
+    s, e = 0, 0
+    for i in range(num_batches):
+        s, e = i * batch_size, (i + 1) * batch_size
+        batch_data_dict = {k: v[s:e] for k, v in data_dict.items()}
+        out[s:e] = f(batch_data_dict)
+    if e < len(out):
+        batch_data_dict = {k: v[e:] for k, v in data_dict.items()}
+        out[e:] = f(batch_data_dict)
+
+#Classes to be imported
 class WeightReader:
     def __init__(self, weight_file):
         with open(weight_file, 'rb') as w_f:
@@ -489,57 +788,544 @@ class BoundBox:
 
         return self.score
 # os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"    
+class Detection(object):
 
 
-#Calling functions in main
+    def __init__(self, tlwh, confidence, class_name, feature):
+        self.tlwh = np.asarray(tlwh, dtype=float)
+        self.confidence = float(confidence)
+        self.class_name = class_name
+        self.feature = np.asarray(feature, dtype=float)
+
+    def get_class(self):
+        return self.class_name
+
+    def to_tlbr(self):
+        ret = self.tlwh.copy()
+        ret[2:] += ret[:2]
+        return ret
+
+    def to_xyah(self):
+        ret = self.tlwh.copy()
+        ret[:2] += ret[2:] / 2
+        ret[2] /= ret[3]
+        return ret
+
+class ImageEncoder(object):
+
+    def __init__(self, checkpoint_filename, input_name="images", output_name="features"):
+        self.session = tf.Session()
+        with tf.io.gfile.GFile(checkpoint_filename, "rb") as file_handle:
+            graph_def = tf.compat.v1.GraphDef()
+            graph_def.ParseFromString(file_handle.read())
+        tf.import_graph_def(graph_def)
+        try:
+            self.input_var = tf.get_default_graph().get_tensor_by_name(input_name)
+            self.output_var = tf.get_default_graph().get_tensor_by_name(output_name)
+        except KeyError:
+            layers = [i.name for i in tf.get_default_graph().get_operations()]
+            self.input_var = tf.get_default_graph().get_tensor_by_name(layers[0]+':0')
+            self.output_var = tf.get_default_graph().get_tensor_by_name(layers[-1]+':0')            
+
+        assert len(self.output_var.get_shape()) == 2
+        assert len(self.input_var.get_shape()) == 4
+        self.feature_dim = self.output_var.get_shape().as_list()[-1]
+        self.image_shape = self.input_var.get_shape().as_list()[1:]
+
+    def __call__(self, data_x, batch_size=32):
+        out = np.zeros((len(data_x), self.feature_dim), np.float32)
+        _run_in_batches(
+            lambda x: self.session.run(self.output_var, feed_dict=x),
+            {self.input_var: data_x}, out, batch_size)
+        return out
+
+
+
+class KalmanFilter(object):
+
+    def __init__(self):
+        ndim, dt = 4, 1.
+
+        # Create Kalman filter model matrices.
+        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
+        for i in range(ndim):
+            self._motion_mat[i, ndim + i] = dt
+        self._update_mat = np.eye(ndim, 2 * ndim)
+
+        # Motion and observation uncertainty are chosen relative to the current
+        # state estimate. These weights control the amount of uncertainty in
+        # the model. This is a bit hacky.
+        self._std_weight_position = 1. / 20
+        self._std_weight_velocity = 1. / 160
+
+    def initiate(self, measurement):
+
+        mean_pos = measurement
+        mean_vel = np.zeros_like(mean_pos)
+        mean = np.r_[mean_pos, mean_vel]
+
+        std = [
+            2 * self._std_weight_position * measurement[3],
+            2 * self._std_weight_position * measurement[3],
+            1e-2,
+            2 * self._std_weight_position * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            1e-5,
+            10 * self._std_weight_velocity * measurement[3]]
+        covariance = np.diag(np.square(std))
+        return mean, covariance
+
+    def predict(self, mean, covariance):
+
+        std_pos = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-2,
+            self._std_weight_position * mean[3]]
+        std_vel = [
+            self._std_weight_velocity * mean[3],
+            self._std_weight_velocity * mean[3],
+            1e-5,
+            self._std_weight_velocity * mean[3]]
+        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+
+        mean = np.dot(self._motion_mat, mean)
+        covariance = np.linalg.multi_dot((
+            self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
+
+        return mean, covariance
+
+    def project(self, mean, covariance):
+
+        std = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-1,
+            self._std_weight_position * mean[3]]
+        innovation_cov = np.diag(np.square(std))
+
+        mean = np.dot(self._update_mat, mean)
+        covariance = np.linalg.multi_dot((
+            self._update_mat, covariance, self._update_mat.T))
+        return mean, covariance + innovation_cov
+
+    def update(self, mean, covariance, measurement):
+        projected_mean, projected_cov = self.project(mean, covariance)
+
+        chol_factor, lower = scipy.linalg.cho_factor(
+            projected_cov, lower=True, check_finite=False)
+        kalman_gain = scipy.linalg.cho_solve(
+            (chol_factor, lower), np.dot(covariance, self._update_mat.T).T,
+            check_finite=False).T
+        innovation = measurement - projected_mean
+
+        new_mean = mean + np.dot(innovation, kalman_gain.T)
+        new_covariance = covariance - np.linalg.multi_dot((
+            kalman_gain, projected_cov, kalman_gain.T))
+        return new_mean, new_covariance
+
+    def gating_distance(self, mean, covariance, measurements,
+                        only_position=False):
+
+        mean, covariance = self.project(mean, covariance)
+        if only_position:
+            mean, covariance = mean[:2], covariance[:2, :2]
+            measurements = measurements[:, :2]
+
+        cholesky_factor = np.linalg.cholesky(covariance)
+        d = measurements - mean
+        z = scipy.linalg.solve_triangular(
+            cholesky_factor, d.T, lower=True, check_finite=False,
+            overwrite_b=True)
+        squared_maha = np.sum(z * z, axis=0)
+        return squared_maha
+
+class NearestNeighborDistanceMetric(object):
+    def __init__(self, metric, matching_threshold, budget=None):
+
+
+        if metric == "euclidean":
+            self._metric = _nn_euclidean_distance
+        elif metric == "cosine":
+            self._metric = _nn_cosine_distance
+        else:
+            raise ValueError(
+                "Invalid metric; must be either 'euclidean' or 'cosine'")
+        self.matching_threshold = matching_threshold
+        self.budget = budget
+        self.samples = {}
+
+    def partial_fit(self, features, targets, active_targets):
+        for feature, target in zip(features, targets):
+            self.samples.setdefault(target, []).append(feature)
+            if self.budget is not None:
+                self.samples[target] = self.samples[target][-self.budget:]
+        self.samples = {k: self.samples[k] for k in active_targets}
+
+    def distance(self, features, targets):
+        cost_matrix = np.zeros((len(targets), len(features)))
+        for i, target in enumerate(targets):
+            cost_matrix[i, :] = self._metric(self.samples[target], features)
+        return cost_matrix
+
+class TrackState:
+    Tentative = 1
+    Confirmed = 2
+    Deleted = 3
+
+
+class Track:
+
+    def __init__(self, mean, covariance, track_id, n_init, max_age,
+                 feature=None, class_name=None):
+        self.mean = mean
+        self.covariance = covariance
+        self.track_id = track_id
+        self.hits = 1
+        self.age = 1
+        self.time_since_update = 0
+
+        self.state = TrackState.Tentative
+        self.features = []
+        if feature is not None:
+            self.features.append(feature)
+
+        self._n_init = n_init
+        self._max_age = max_age
+        self.class_name = class_name
+
+    def to_tlwh(self):
+
+        ret = self.mean[:4].copy()
+        ret[2] *= ret[3]
+        ret[:2] -= ret[2:] / 2
+        return ret
+
+    def to_tlbr(self):
+        ret = self.to_tlwh()
+        ret[2:] = ret[:2] + ret[2:]
+        return ret
+    
+    def get_class(self):
+        return self.class_name
+
+    def predict(self, kf):
+        self.mean, self.covariance = kf.predict(self.mean, self.covariance)
+        self.age += 1
+        self.time_since_update += 1
+
+    def update(self, kf, detection):
+        self.mean, self.covariance = kf.update(
+            self.mean, self.covariance, detection.to_xyah())
+        self.features.append(detection.feature)
+
+        self.hits += 1
+        self.time_since_update = 0
+        if self.state == TrackState.Tentative and self.hits >= self._n_init:
+            self.state = TrackState.Confirmed
+
+    def mark_missed(self):
+        if self.state == TrackState.Tentative:
+            self.state = TrackState.Deleted
+        elif self.time_since_update > self._max_age:
+            self.state = TrackState.Deleted
+
+    def is_tentative(self):
+        return self.state == TrackState.Tentative
+
+    def is_confirmed(self):
+        return self.state == TrackState.Confirmed
+
+    def is_deleted(self):
+        return self.state == TrackState.Deleted
+
+
+class Tracker:
+
+    def __init__(self, metric, max_iou_distance=0.7, max_age=30, n_init=3):
+        self.metric = metric
+        self.max_iou_distance = max_iou_distance
+        self.max_age = max_age
+        self.n_init = n_init
+
+        self.kf = KalmanFilter()
+        self.tracks = []
+        self._next_id = 1
+
+    def predict(self):
+        for track in self.tracks:
+            track.predict(self.kf)
+
+    def update(self, detections):
+        # Run matching cascade.
+        matches, unmatched_tracks, unmatched_detections = \
+            self._match(detections)
+
+        # Update track set.
+        for track_idx, detection_idx in matches:
+            self.tracks[track_idx].update(
+                self.kf, detections[detection_idx])
+        for track_idx in unmatched_tracks:
+            self.tracks[track_idx].mark_missed()
+        for detection_idx in unmatched_detections:
+            self._initiate_track(detections[detection_idx])
+        self.tracks = [t for t in self.tracks if not t.is_deleted()]
+
+        # Update distance metric.
+        active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
+        features, targets = [], []
+        for track in self.tracks:
+            if not track.is_confirmed():
+                continue
+            features += track.features
+            targets += [track.track_id for _ in track.features]
+            track.features = []
+        self.metric.partial_fit(
+            np.asarray(features), np.asarray(targets), active_targets)
+
+    def _match(self, detections):
+
+        def gated_metric(tracks, dets, track_indices, detection_indices):
+            features = np.array([dets[i].feature for i in detection_indices])
+            targets = np.array([tracks[i].track_id for i in track_indices])
+            cost_matrix = self.metric.distance(features, targets)
+            cost_matrix = gate_cost_matrix(
+                self.kf, cost_matrix, tracks, dets, track_indices,
+                detection_indices)
+
+            return cost_matrix
+
+        # Split track set into confirmed and unconfirmed tracks.
+        confirmed_tracks = [
+            i for i, t in enumerate(self.tracks) if t.is_confirmed()]
+        unconfirmed_tracks = [
+            i for i, t in enumerate(self.tracks) if not t.is_confirmed()]
+
+        # Associate confirmed tracks using appearance features.
+        matches_a, unmatched_tracks_a, unmatched_detections = \
+                matching_cascade(
+                gated_metric, self.metric.matching_threshold, self.max_age,
+                self.tracks, detections, confirmed_tracks)
+
+        # Associate remaining tracks together with unconfirmed tracks using IOU.
+        iou_track_candidates = unconfirmed_tracks + [
+            k for k in unmatched_tracks_a if
+            self.tracks[k].time_since_update == 1]
+        unmatched_tracks_a = [
+            k for k in unmatched_tracks_a if
+            self.tracks[k].time_since_update != 1]
+        matches_b, unmatched_tracks_b, unmatched_detections = \
+                min_cost_matching(
+                iou_cost, self.max_iou_distance, self.tracks,
+                detections, iou_track_candidates, unmatched_detections)
+
+        matches = matches_a + matches_b
+        unmatched_tracks = list(set(unmatched_tracks_a + unmatched_tracks_b))
+        return matches, unmatched_tracks, unmatched_detections
+
+    def _initiate_track(self, detection):
+        mean, covariance = self.kf.initiate(detection.to_xyah())
+        class_name = detection.get_class()
+        self.tracks.append(Track(
+            mean, covariance, self._next_id, self.n_init, self.max_age,
+            detection.feature, class_name))
+        self._next_id += 1
+
+
+
+
+
+# Load Video
+# video_path = "C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/testing/Copy of NO20230924-121041-000402B.mp4"  # Change this to your video file
+# vid = cv2.VideoCapture(video_path)
+# width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+# height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# fps = int(vid.get(cv2.CAP_PROP_FPS))
+# # Output Video Writer
+# output_path = "predicted_video.mp4"
+# fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+# out = cv2.VideoWriter(output_path, fourcc, 20.0, (int(vid.get(3)), int(vid.get(4))))
+# model_filename = 'mars-small128.pb'
+# encoder = create_box_encoder(model_filename, batch_size=1)
+# # Process Each Frame
+# while vid.isOpened():
+#     ret, frame = vid.read()
+#     if not ret:
+#         break
+#     try:
+#         original_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+#         original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+#     except:
+#         break
+#     image_data, image_w, image_h = image_preprocess(np.copy(original_frame), (WIDTH, HEIGHT))
+#     yhat = model.predict(image_data)
+#     boxes = list()
+#     for i in range(len(yhat)):
+#         boxes += decode_netout(yhat[i][0], anchors[i], class_threshold, HEIGHT, WIDTH)
+#     correct_yolo_boxes(boxes, image_h, image_w, HEIGHT, WIDTH)
+#     do_nms(boxes, 0.3)
+#     labels = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck","boat"]
+#     v_boxes, v_labels, v_scores = get_boxes(boxes, labels, class_threshold)
+#     boxes = []
+#     names = []
+#     scores = []
+#     for box, label, score in zip(v_boxes, v_labels, v_scores):
+#             boxes.append([
+#                  box.xmin, box.ymin, 
+#                 (box.xmax - box.xmin), (box.ymax - box.ymin) * 2])
+#             names.append(label)
+#             scores.append(score)
+
+#     boxes = np.array(boxes) 
+#     names = np.array(names)
+#     scores = np.array(scores)
+#     features = np.array(encoder(original_frame, boxes))
+#     detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in zip(boxes, scores, names, features)]
+#     image = draw_bbox(original_frame, tracked_bboxes, CLASSES=NUM_CLASS, tracking=True)
+#     # Write Frame to Output Video
+#     out.write(frame)
+
+#     # Display Frame (Optional)
+#     cv2.imshow("YOLOv3 Object Detection", frame)
+#     if cv2.waitKey(1) & 0xFF == ord('q'):
+#         break
+
+# vid.release()
+# out.release()
+# cv2.destroyAllWindows()
+
+
+#Main call
 # define the model
 model = make_yolov3_model()
-
-# load the model weights
-# I have loaded the pretrained weights in a separate dataset
-weight_reader = WeightReader('C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/yolov3.weights')
-
-# set the model weights into the model
+weight_reader = WeightReader('yolov3.weights')
 weight_reader.load_weights(model)
-
-# save the model to file
 model.save('model.h5')
 model = load_model('model.h5')
-# Parameters used in the Dataset, on which YOLOv3 was pretrained
 anchors = [[116,90, 156,198, 373,326], [30,61, 62,45, 59,119], [10,13, 16,30, 33,23]]
-
-# define the expected input shape for the model
 WIDTH, HEIGHT = 416, 416
-
-# define the probability threshold for detected objects
 class_threshold = 0.8
 
-#To be commented
-# define our new photo
-photo_filename = 'C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/test.jpg'
-# load and prepare image
-image, image_w, image_h = load_image_pixels(photo_filename, (WIDTH, HEIGHT))
-# make prediction
-yhat = model.predict(image)
-# summarize the shape of the list of arrays
-print([a.shape for a in yhat])
-boxes = list()
-for i in range(len(yhat)):
-	# decode the output of the network
-	boxes += decode_netout(yhat[i][0], anchors[i], class_threshold, HEIGHT, WIDTH)
-# correct the sizes of the bounding boxes for the shape of the image
-correct_yolo_boxes(boxes, image_h, image_w, HEIGHT, WIDTH)
-# suppress non-maximal boxes
-do_nms(boxes, 0.4)
-# define the labels
-labels = []
-with open("C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/coco.names", "r") as f:
-    labels = [line.strip() for line in f.readlines()]
-v_boxes, v_labels, v_scores = get_boxes(boxes, labels, class_threshold)
-# summarize what we found
-for i in range(len(v_boxes)):
-	print(v_labels[i], v_scores[i])
-# draw what we found
-draw_boxes(photo_filename, v_boxes, v_labels, v_scores)
+max_cosine_distance = 0.7
+max_euclidean_distance = 0.7
+nn_budget = None
+model_filename = 'mars-small128.pb'
+
+key_list = list(NUM_CLASS.keys()) 
+val_list = list(NUM_CLASS.values()) 
+
+def object_tracking(video_path, output_path):
+    encoder = create_box_encoder(model_filename, batch_size=1)
+    metric = NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
+    tracker = Tracker(metric)
+    
+    times, times_2 = [], []
+    vid = cv2.VideoCapture(video_path) # detect on video
+
+    # by default VideoCapture returns float instead of int
+    width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(vid.get(cv2.CAP_PROP_FPS))
+    codec = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(output_path, codec, fps, (width, height)) # output_path must be .mp4
+    
+    while True:
+        _, frame = vid.read()
+
+        try:
+            original_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+        except:
+            break
+
+        # Load picture with old dimensions
+        image_data, image_w, image_h = image_preprocess(np.copy(original_frame), (WIDTH, HEIGHT))
+
+        # Predict Image
+        t1 = time.time()
+        yhat = model.predict(image_data)
+
+        # Create boxes
+        boxes = list()
+        for i in range(len(yhat)):
+            boxes += decode_netout(yhat[i][0], anchors[i], class_threshold, HEIGHT, WIDTH)
+
+        # Correct the sizes of boxes for shape of image
+        correct_yolo_boxes(boxes, image_h, image_w, HEIGHT, WIDTH)
+
+        # Suppress Non Maximal Boxes
+        do_nms(boxes, 0.3)
+
+        # define the labels (Filtered only the ones relevant for this task, which were used in pretraining the YOLOv3 model)
+        labels = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck","boat"]
+
+        # get the details of the detected objects
+        v_boxes, v_labels, v_scores = get_boxes(boxes, labels, class_threshold)
 
 
+        #t1 = time.time()
+        #pred_bbox = Yolo.predict(image_data)
+        t2 = time.time()
+
+        # Obtain all the detections for the given frame
+        boxes = []
+        names = []
+        scores = []
+        for box, label, score in zip(v_boxes, v_labels, v_scores):
+            boxes.append([
+                 box.xmin, box.ymin, 
+                (box.xmax - box.xmin), (box.ymax - box.ymin) * 2])
+            names.append(label)
+            scores.append(score)
+
+        boxes = np.array(boxes) 
+        names = np.array(names)
+        scores = np.array(scores)
+        features = np.array(encoder(original_frame, boxes))
+        detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in zip(boxes, scores, names, features)]
+
+        # Pass detections to the deepsort object and obtain the track information.
+        tracker.predict()
+        tracker.update(detections)
+
+        # Obtain info from the tracks
+        tracked_bboxes = []
+        for track in tracker.tracks:
+            if not track.is_confirmed() or track.time_since_update > 5:
+                continue 
+            bbox = track.to_tlbr() # Get the corrected/predicted bounding box
+            class_name = track.get_class() #Get the class name of particular object
+            tracking_id = track.track_id # Get the ID for the particular track
+            index = key_list[val_list.index(class_name)] # Get predicted object index by object name
+            tracked_bboxes.append(bbox.tolist() + [tracking_id, index]) # Structure data, that we could use it with our draw_bbox function
+
+        # draw detection on frame
+        image = draw_bbox(original_frame, tracked_bboxes, CLASSES=NUM_CLASS, tracking=True)
+
+        t3 = time.time()
+        times.append(t2-t1)
+        times_2.append(t3-t1)
+
+        times = times[-20:]
+        times_2 = times_2[-20:]
+
+        ms = sum(times)/len(times)*1000
+        fps = 1000 / ms
+        fps2 = 1000 / (sum(times_2)/len(times_2)*1000)
+
+        image = cv2.putText(image, "Time: {:.1f} FPS".format(fps), (0, 30), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (0, 0, 255), 2)
+
+        # draw original yolo detection
+        #image = draw_bbox(image, bboxes, CLASSES=CLASSES, show_label=False, rectangle_colors=rectangle_colors, tracking=True)
+
+        print("Time: {:.2f}ms, Detection FPS: {:.1f}, total FPS: {:.1f}".format(ms, fps, fps2))
+        out.write(image)
+
+    out.release()
+    vid.release()
+
+
+input_path = "C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/testing/Copy of NO20230924-121041-000402B.mp4"
+Output_path = "C:/Users/Abhay/OneDrive/Desktop/Projects/Rearview_collision_warning/rearview_collision_warning/testing/predicted_video.mp4"
+object_tracking(input_path,Output_path)
